@@ -284,7 +284,16 @@ def save_images(object_file: str) -> None:
     K = get_spad_K()
     cam_poses = np.stack(cam_poses, 0)
     meta_path = os.path.join(args.output_dir, object_uid, "meta.pkl")
-    save_pickle([K, azimuths, elevations, distances, cam_poses], meta_path)
+    meta = {
+        "K": K,                         # (3x3) intrinsic matrix
+        "azimuths": azimuths,           # (num_views,) in radians
+        "elevations": elevations,       # (num_views,) in radians
+        "distances": distances,         # (num_views,) camera radius
+        "cam_poses": cam_poses,         # (num_views, 3, 4)
+        "object_id": object_uid,        # string id
+    }
+
+    save_pickle(meta, meta_path)
 
 
 if __name__ == "__main__":

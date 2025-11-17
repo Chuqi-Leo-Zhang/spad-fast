@@ -478,6 +478,9 @@ class UNetModel(nn.Module):
         legacy=True,
         disable_self_attentions=None,
         num_attention_blocks=None,
+        lora_rank=4,                      # LoRA support
+        lora_alpha=1.0,                   # LoRA support
+        use_lora=False,                   # LoRA support
         **kwargs
     ):
         for k,v in kwargs.items():

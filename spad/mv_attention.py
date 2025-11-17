@@ -1,12 +1,14 @@
 from inspect import isfunction
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import nn, einsum
 from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint, conv_nd
 from ldm.modules.attention import *
+from spad.lora import LoRALinear
 
 try:
     import xformers
@@ -18,24 +20,37 @@ print(f"XFORMERS_IS_AVAILBLE: {XFORMERS_IS_AVAILBLE}")
 
 
 class SPADAttention(nn.Module):
-    """Uses xformers to implement efficient epipolar masking for cross-attention between views."""
+    """SPAD attention block with LoRA-enabled projections."""
 
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0,
+                 lora_rank=4, lora_alpha=1.0, use_lora=False):
         super().__init__()
+
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
         self.heads = heads
         self.dim_head = dim_head
+        self.use_lora = use_lora
 
+        # --- base layers ---
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
         )
-        self.attention_op: Optional[Any] = None
+
+        # --- wrap with LoRA ---
+        if use_lora:
+            self.to_q = LoRALinear(self.to_q, r=lora_rank, alpha=lora_alpha)
+            self.to_k = LoRALinear(self.to_k, r=lora_rank, alpha=lora_alpha)
+            self.to_v = LoRALinear(self.to_v, r=lora_rank, alpha=lora_alpha)
+
+            # only wrap the linear projection inside to_out
+            self.to_out[0] = LoRALinear(self.to_out[0], r=lora_rank, alpha=lora_alpha)
+
+        self.attention_op = None
 
     def forward(self, x, context=None, mask=None, views=None):
         q = self.to_q(x)
@@ -103,6 +118,92 @@ class SPADAttention(nn.Module):
         return self.to_out(out)
 
 
+# class SPADAttention(nn.Module):
+#     """Uses xformers to implement efficient epipolar masking for cross-attention between views."""
+
+#     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+#         super().__init__()
+#         inner_dim = dim_head * heads
+#         context_dim = default(context_dim, query_dim)
+
+#         self.heads = heads
+#         self.dim_head = dim_head
+
+#         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+#         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+#         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+#         self.to_out = nn.Sequential(
+#             nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
+#         )
+#         self.attention_op: Optional[Any] = None
+
+#     def forward(self, x, context=None, mask=None, views=None):
+#         q = self.to_q(x)
+#         context = default(context, x)
+#         k = self.to_k(context)
+#         v = self.to_v(context)
+
+#         b, _, _ = q.shape
+
+#         # epipolar mask
+#         if mask is not None:
+#             mask = mask.unsqueeze(1)
+#             mask_shape = (q.shape[-2], k.shape[-2])
+
+#             # interpolate epipolar mask to match downsampled unet branch
+#             mask = (
+#                 F.interpolate(mask.to(torch.uint8), size=mask_shape).bool().squeeze(1)
+#             )
+
+#             # repeat mask for each attention head
+#             mask = (
+#                 mask.unsqueeze(1)
+#                 .repeat(1, self.heads, 1, 1)
+#                 .reshape(b * self.heads, *mask.shape[-2:])
+#             )
+
+#         q, k, v = map(
+#             lambda t: t.unsqueeze(3)
+#             .reshape(b, t.shape[1], self.heads, self.dim_head)
+#             .permute(0, 2, 1, 3)
+#             .reshape(b * self.heads, t.shape[1], self.dim_head)
+#             .contiguous(),
+#             (q, k, v),
+#         )
+
+#         with torch.autocast(enabled=False, device_type="cuda"):
+#             q, k, v = q.float(), k.float(), v.float()
+            
+#             mask_inf = 1e9
+#             fmask = None
+#             if mask is not None:
+#                 # convert to attention bias
+#                 fmask = mask.float()
+#                 fmask[fmask == 0] = -mask_inf
+#                 fmask[fmask == 1] = 0
+            
+#             # actually compute the attention, what we cannot get enough of
+#             out = xformers.ops.memory_efficient_attention(
+#                 q, k, v, attn_bias=fmask, op=self.attention_op
+#             )
+
+#         out = (
+#             out.unsqueeze(0)
+#             .reshape(b, self.heads, out.shape[1], self.dim_head)
+#             .permute(0, 2, 1, 3)
+#             .reshape(b, out.shape[1], self.heads * self.dim_head)
+#         )
+
+#         # no nans
+#         if out.isnan().any():
+#             breakpoint()
+
+#         # cleanup
+#         del q, k, v
+#         return self.to_out(out)
+
+
 class SPADTransformerBlock(nn.Module):
     """Modified SPAD transformer block that enables spatially aware cross-attention."""
 
@@ -116,6 +217,9 @@ class SPADTransformerBlock(nn.Module):
         gated_ff=True,
         checkpoint=True,
         disable_self_attn=False,
+        lora_rank=4,
+        lora_alpha=1.0,
+        use_lora=False,
     ):
         super().__init__()
         attn_cls = SPADAttention
@@ -126,14 +230,21 @@ class SPADTransformerBlock(nn.Module):
             dim_head=d_head,
             dropout=dropout,
             context_dim=context_dim if self.disable_self_attn else None,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            use_lora=use_lora,
         )  # is a self-attention if not self.disable_self_attn
-        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff, 
+                              lora_rank=lora_rank, lora_alpha=lora_alpha, use_lora=use_lora)
         self.attn2 = attn_cls(
             query_dim=dim,
             context_dim=context_dim,
             heads=n_heads,
             dim_head=d_head,
             dropout=dropout,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            use_lora=use_lora,
         )  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -183,6 +294,9 @@ class SPADTransformer(nn.Module):
         disable_self_attn=False,
         use_linear=False,  # 2.1 vs 1.5 difference
         use_checkpoint=True,
+        lora_rank=4,
+        lora_alpha=1.0,
+        use_lora=False,
     ):
         super().__init__()
         if exists(context_dim) and not isinstance(context_dim, list):
@@ -207,6 +321,9 @@ class SPADTransformer(nn.Module):
                     context_dim=context_dim[d],
                     disable_self_attn=disable_self_attn,
                     checkpoint=use_checkpoint,
+                    lora_rank=lora_rank,
+                    lora_alpha=lora_alpha,
+                    use_lora=use_lora,
                 )
                 for d in range(depth)
             ]

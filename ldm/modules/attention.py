@@ -6,6 +6,7 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint
+from spad.lora import LoRALinear
 
 try:
     import xformers
@@ -42,9 +43,11 @@ def init_(tensor):
 
 # feedforward
 class GEGLU(nn.Module):
-    def __init__(self, dim_in, dim_out):
+    def __init__(self, dim_in, dim_out, lora_rank=4, lora_alpha=1.0, use_lora=False):
         super().__init__()
         self.proj = nn.Linear(dim_in, dim_out * 2)
+        if use_lora:
+            self.proj = LoRALinear(self.proj, r=lora_rank, alpha=lora_alpha)
 
     def forward(self, x):
         x, gate = self.proj(x).chunk(2, dim=-1)
@@ -52,20 +55,30 @@ class GEGLU(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.,
+                 lora_rank=4, lora_alpha=1.0, use_lora=False):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
-        project_in = nn.Sequential(
-            nn.Linear(dim, inner_dim),
-            nn.GELU()
-        ) if not glu else GEGLU(dim, inner_dim)
+        
+        if not glu:
+            project_in = nn.Sequential(
+                nn.Linear(dim, inner_dim),
+                nn.GELU()
+            )
+            if use_lora:
+                project_in[0] = LoRALinear(project_in[0], r=lora_rank, alpha=lora_alpha)
+        else:
+            project_in = GEGLU(dim, inner_dim, lora_rank=lora_rank, lora_alpha=lora_alpha, use_lora=use_lora)
 
         self.net = nn.Sequential(
             project_in,
             nn.Dropout(dropout),
             nn.Linear(inner_dim, dim_out)
         )
+        
+        if use_lora:
+            self.net[2] = LoRALinear(self.net[2], r=lora_rank, alpha=lora_alpha)
 
     def forward(self, x):
         return self.net(x)

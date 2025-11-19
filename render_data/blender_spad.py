@@ -111,6 +111,15 @@ scene.cycles.use_denoising = True
 
 scene.render.film_transparent = False
 
+# --- Make white actually white (disable Filmic tone mapping) ---
+scene.display_settings.display_device = "sRGB"
+scene.view_settings.view_transform = "Standard"
+scene.view_settings.look = "None"
+scene.view_settings.exposure = 0.0
+scene.view_settings.gamma = 1.0
+# ---------------------------------------------------------------
+
+
 bpy.context.preferences.addons["cycles"].preferences.get_devices()
 bpy.context.preferences.addons[
     "cycles"

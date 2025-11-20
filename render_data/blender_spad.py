@@ -49,6 +49,7 @@ parser.add_argument(
 )
 parser.add_argument("--num_images", type=int, default=12)  # SPAD uses 12 views
 parser.add_argument("--device", type=str, default="CUDA")
+parser.add_argument("--caption", type=str, default="")  # caption for the object
 argv = sys.argv[sys.argv.index("--") + 1 :]
 args = parser.parse_args(argv)
 
@@ -300,6 +301,7 @@ def save_images(object_file: str) -> None:
         "distances": distances,         # (num_views,) camera radius
         "cam_poses": cam_poses,         # (num_views, 3, 4)
         "object_id": object_uid,        # string id
+        "caption": args.caption,        # caption for the object
     }
 
     save_pickle(meta, meta_path)

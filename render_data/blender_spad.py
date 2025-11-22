@@ -131,17 +131,76 @@ bpy.context.scene.cycles.tile_size = 8192
 # ------------------------- Geometry helpers -------------------------
 
 
-def az_el_to_points(azimuths, elevations):
-    x = np.cos(azimuths) * np.cos(elevations)
-    y = np.sin(azimuths) * np.cos(elevations)
-    z = np.sin(elevations)
-    return np.stack([x, y, z], -1)
+def spherical_to_cartesian(spherical_coords):
+    """
+    Convert from spherical to cartesian coordinates.
+
+    spherical_coords: array of shape [N, 3] with columns
+        [elevation (theta), azimuth (phi), radius]
+    This matches the convention used in SPAD's geometry.
+    """
+    theta, azimuth, radius = spherical_coords.T
+    x = radius * np.sin(theta) * np.cos(azimuth)
+    y = radius * np.sin(theta) * np.sin(azimuth)
+    z = radius * np.cos(theta)
+    return np.stack([x, y, z], axis=-1)
+
+
+def look_at(eye, center, up):
+    """
+    Same look_at as SPAD: build a camera-from-world rotation and translation.
+    """
+    eye = np.array(eye, dtype=np.float32)
+    center = np.array(center, dtype=np.float32)
+    up = np.array(up, dtype=np.float32)
+
+    f = center - eye
+    f = f / np.linalg.norm(f)
+
+    up_norm = up / np.linalg.norm(up)
+    s = np.cross(f, up_norm)
+    s = s / np.linalg.norm(s)
+
+    u = np.cross(s, f)
+
+    R = np.array(
+        [
+            [s[0], s[1], s[2]],
+            [u[0], u[1], u[2]],
+            [-f[0], -f[1], -f[2]],
+        ],
+        dtype=np.float32,
+    )
+    T = -R @ eye
+    return R, T
+
+
+def get_blender_from_spherical_np(elevation, azimuth, radius=CAMERA_RADIUS):
+    """
+    NumPy clone of SPAD's get_blender_from_spherical.
+
+    Returns a 3x4 camera matrix [R|t] in the same convention SPAD uses
+    for Plücker / epipolar geometry.
+    """
+    cart = spherical_to_cartesian(
+        np.array([[elevation, azimuth, radius]], dtype=np.float32)
+    )
+    eye = cart[0]
+    center = np.zeros(3, dtype=np.float32)
+    up = np.array([0, 0, 1], dtype=np.float32)
+
+    R, T = look_at(eye, center, up)
+    # same post-processing as original SPAD code
+    R = R.T
+    T = -R @ T
+    RT = np.concatenate([R, T[:, None]], axis=1)  # [3,4]
+    return RT, eye  # return both extrinsic and camera center
 
 
 def set_camera_location(cam_pt):
     x, y, z = cam_pt
     camera = bpy.data.objects["Camera"]
-    camera.location = (x, y, z)
+    camera.location = (float(x), float(y), float(z))
     return camera
 
 
@@ -198,9 +257,10 @@ def scene_bbox(single_obj=None, ignore_matrix=False):
 
 
 def normalize_scene():
-    """Center & rescale objects to fit into a unit cube (-1..1)^3, as in SPAD."""
+    """Center & rescale objects so longest side fits into (-1, 1)^3."""
     bbox_min, bbox_max = scene_bbox()
-    scale = 1.0 / max(bbox_max - bbox_min)
+    longest = max(bbox_max - bbox_min)       # length of longest side
+    scale = 2.0 / float(longest)            # longest side spans [-1,1]
     for obj in scene_root_objects():
         obj.scale = obj.scale * scale
 
@@ -210,23 +270,6 @@ def normalize_scene():
     for obj in scene_root_objects():
         obj.matrix_world.translation += offset
     bpy.ops.object.select_all(action="DESELECT")
-
-
-# function from shapenet renderer
-def get_3x4_RT_matrix_from_blender(cam):
-    bpy.context.view_layer.update()
-    location, rotation = cam.matrix_world.decompose()[0:2]
-    R = np.asarray(rotation.to_matrix())
-    t = np.asarray(location)
-
-    cam_rec = np.asarray([[1, 0, 0], [0, -1, 0], [0, 0, -1]], np.float32)
-    R = R.T
-    t = -R @ t
-    R_world2cv = cam_rec @ R
-    t_world2cv = cam_rec @ t
-
-    RT = np.concatenate([R_world2cv, t_world2cv[:, None]], 1)
-    return RT
 
 
 # ------------------------- Main render -------------------------
@@ -253,15 +296,17 @@ def save_images(object_file: str) -> None:
     )
     back_node.inputs["Strength"].default_value = ENV_LIGHT
 
-    # *** CHANGED: radius matches SPAD's 3.5, not 1.5 ***
-    distances = np.asarray([CAMERA_RADIUS for _ in range(args.num_images)], np.float32)
+    # radii are fixed at CAMERA_RADIUS
+    distances = np.asarray(
+        [CAMERA_RADIUS for _ in range(args.num_images)], np.float32
+    )
 
-    # *** CHANGED: elevation range [-90, 90] deg; azimuth uniform [0, 2π] ***
+    # sample spherical angles
     if args.camera_type == "fixed":
         azimuths = (
             np.arange(args.num_images) / args.num_images * 2 * np.pi
         ).astype(np.float32)
-        elev_deg = np.random.uniform(ELEV_MIN_DEG, ELEV_MAX_DEG)
+        elev_deg = 45.0  # fixed elevation (like SPAD's eval)
         elevations = np.deg2rad(
             np.full(args.num_images, elev_deg, dtype=np.float32)
         )
@@ -276,13 +321,15 @@ def save_images(object_file: str) -> None:
     else:
         raise NotImplementedError
 
-    cam_pts = az_el_to_points(azimuths, elevations) * distances[:, None]
     cam_poses = []
 
-    for i in range(args.num_images):
-        camera = set_camera_location(cam_pts[i])
-        RT = get_3x4_RT_matrix_from_blender(camera)
+    for i, (elev, az) in enumerate(zip(elevations, azimuths)):
+        # get SPAD-style extrinsic + camera center from spherical angles
+        RT, eye = get_blender_from_spherical_np(float(elev), float(az))
         cam_poses.append(RT)
+
+        # move Blender camera to the same center; TRACK_TO enforces orientation
+        camera = set_camera_location(eye)
 
         render_path = os.path.join(args.output_dir, object_uid, f"{i:03d}.png")
         if os.path.exists(render_path):
@@ -292,14 +339,14 @@ def save_images(object_file: str) -> None:
 
     # save meta: intrinsics + spherical coords + radii + extrinsics
     K = get_spad_K()
-    cam_poses = np.stack(cam_poses, 0)
+    cam_poses = np.stack(cam_poses, 0)  # [num_views, 3, 4]
     meta_path = os.path.join(args.output_dir, object_uid, "meta.pkl")
     meta = {
         "K": K,                         # (3x3) intrinsic matrix
         "azimuths": azimuths,           # (num_views,) in radians
         "elevations": elevations,       # (num_views,) in radians
         "distances": distances,         # (num_views,) camera radius
-        "cam_poses": cam_poses,         # (num_views, 3, 4)
+        "cam_poses": cam_poses,         # (num_views, 3, 4) SPAD-style RT
         "object_id": object_uid,        # string id
         "caption": args.caption,        # caption for the object
     }

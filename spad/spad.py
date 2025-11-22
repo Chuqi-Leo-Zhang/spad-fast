@@ -67,6 +67,7 @@ class SPAD(LatentDiffusion):
         cam = batch['cam'].to(memory_format=torch.contiguous_format).to(self.device).to(input_type)
         
         # assert shapes
+        # breakpoint()
         assert x.shape[0] == cam.shape[0] == len(xtxt)
         assert x.shape[1] == cam.shape[1] == len(xtxt[0])
         self.get_input_asserts([x, cam, xtxt])

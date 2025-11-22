@@ -108,6 +108,10 @@ class SPADUnetModel(UNetModel):
         n_objects, n_views = x.shape[:2]
 
         # timsteps embedding
+        if timesteps.ndim == 1:
+            n, v = x.shape[:2]
+            timesteps = timesteps[:, None].expand(n, v)
+
         timesteps = rearrange(timesteps, "n v -> (n v)")
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         time = self.time_embed(t_emb)

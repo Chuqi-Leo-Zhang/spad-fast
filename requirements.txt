@@ -24,9 +24,9 @@ diffusers
 datasets
 webdataset
 lpips
-mathutils==2.81.2
+# mathutils==2.81.2
 torch-fidelity
-lightning
+# lightning
 huggingface_hub[cli,torch]
 opencv-python
-xformers
+# xformers

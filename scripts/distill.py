@@ -179,25 +179,18 @@ def train(args):
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
     )
-
+    optimizer.zero_grad(set_to_none=True)
     scaler = GradScaler(enabled=args.fp16)
 
     global_step = 0
+    micro_step = 0
     outdir = args.output_dir
 
     for epoch in range(args.num_epochs):
         print(f"\n===== Epoch {epoch+1}/{args.num_epochs} =====")
 
         for batch_idx, batch in enumerate(train_loader):
-            global_step += 1
-
-            # Apply LR warmup schedule (after incrementing global_step)
-            current_lr = set_lr_with_warmup(
-                optimizer,
-                base_lr=base_lr,
-                global_step=global_step,
-                warmup_steps=warmup_steps,
-            )
+            micro_step += 1
 
             # Move geometry-related tensors to device
             batch["epi_constraint_masks"] = batch["epi_constraint_masks"].to(device)
@@ -223,44 +216,54 @@ def train(args):
             batch["render_intrinsics_flat"] = torch.stack(intr_list, dim=0).to(device)  # [B,V,4]
             batch["txt"] = [batch["txt"]] * V  # replicate captions for all views
 
-            optimizer.zero_grad(set_to_none=True)
-
             with autocast(enabled=args.fp16):
                 # get_input returns [z, cond, ...]
                 z, cond = model.get_input(batch)[:2]
                 # LatentDiffusion.forward returns (loss, loss_dict)
                 loss, loss_dict = model(z, cond)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss_accum = loss / args.accumulate_steps
+            scaler.scale(loss_accum).backward()
+            
+            if micro_step % args.accumulate_steps == 0:
+                global_step += 1
+                # Apply LR warmup schedule (after incrementing global_step)
+                current_lr = set_lr_with_warmup(
+                    optimizer,
+                    base_lr=base_lr,
+                    global_step=global_step,
+                    warmup_steps=warmup_steps,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-            # Update EMA after optimizer
-            if getattr(model, "use_ema", False):
-                model.model_ema(model.model)
+                # Update EMA after optimizer
+                if getattr(model, "use_ema", False):
+                    model.model_ema(model.model)
 
-            # Logging
-            if global_step % args.log_every == 0:
-                loss_val = float(loss.detach().cpu())
-                log_str = f"[step {global_step}] loss: {loss_val:.4f}, lr: {current_lr:.6e}"
-                if isinstance(loss_dict, dict):
-                    parts = []
-                    for k, v in loss_dict.items():
-                        try:
-                            parts.append(f"{k}: {float(v):.4f}")
-                        except Exception:
-                            continue
-                    if parts:
-                        log_str += " | " + " ".join(parts)
-                print(log_str)
+                # Logging
+                if global_step and global_step % args.log_every == 0:
+                    loss_val = float(loss.detach().cpu())
+                    log_str = f"[step {global_step}] loss: {loss_val:.4f}, lr: {current_lr:.6e}"
+                    if isinstance(loss_dict, dict):
+                        parts = []
+                        for k, v in loss_dict.items():
+                            try:
+                                parts.append(f"{k}: {float(v):.4f}")
+                            except Exception:
+                                continue
+                        if parts:
+                            log_str += " | " + " ".join(parts)
+                    print(log_str)
 
-            # Checkpointing
-            if global_step % args.ckpt_every == 0:
-                save_checkpoint(model, optimizer, global_step, outdir)
+                # Checkpointing
+                if global_step % args.ckpt_every == 0:
+                    save_checkpoint(model, optimizer, global_step, outdir)
 
-            if args.max_steps is not None and global_step >= args.max_steps:
-                print(f"Reached max_steps={args.max_steps}, stopping training.")
-                break
+                if args.max_steps is not None and global_step >= args.max_steps:
+                    print(f"Reached max_steps={args.max_steps}, stopping training.")
+                    break
 
         if args.max_steps is not None and global_step >= args.max_steps:
             break
@@ -284,6 +287,7 @@ def parse_args():
     parser.add_argument("--image_size", type=int, default=256,
                         help="Rendered image resolution (assumed square).")
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--accumulate_steps", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
 
     # Model / config

@@ -42,6 +42,7 @@ class ObjaverseMultiViewDataset(Dataset):
         if img.ndim == 3 and img.shape[-1] == 4:
             img = img[..., :3]
 
+        img = img * 2.0 - 1.0  # to [-1, 1]
         return img
 
     def __getitem__(self, idx):

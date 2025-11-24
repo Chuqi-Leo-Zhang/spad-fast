@@ -1,151 +1,155 @@
-# train_spad_lora_distill.py
-
 import os
 import math
 import argparse
-from itertools import cycle
+from pathlib import Path
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
 from omegaconf import OmegaConf
-from pytorch_lightning import seed_everything
-from einops import rearrange
-from tqdm import tqdm
 
 from spad.utils import load_model_from_config
-from spad.spad import SPAD
+from spad.spad import SPAD  # adjust if your SPAD class is in a different module
+from spad.dataloader import ObjaverseMultiViewDataset  # your dataset file
 
-from spad.dataloader import ObjaverseMultiViewDataset
+
+# ------------------------- Camera helpers ------------------------- #
+
+SPAD_FOV = 0.702769935131073  # radians
+CAMERA_RADIUS = 3.5           # distance to origin
 
 
-# ------------------------------------------------------------
-# 1. 一些小工具函数
-# ------------------------------------------------------------
-
-def freeze_base_weights(model):
+def build_cam_and_intrinsics_from_radians(elevations, azimuths,
+                                          use_abs_extrinsics=False):
     """
-    冻结所有非 LoRA 参数。
-    假设 LoRA 参数在名字里带 "lora_" / "lora_down" / "lora_up" 之类。
+    Build 'cam' and 'render_intrinsics_flat' tensors for a single object,
+    given per-view spherical coordinates in radians.
+
+    Inputs:
+        elevations: list/1D tensor of length V, radians
+        azimuths:   list/1D tensor of length V, radians
+    Returns:
+        cam:                    [V, V, 4]
+        render_intrinsics_flat: [V, 4] = [fx, fy, cx, cy]
     """
-    for name, p in model.named_parameters():
-        if any(k in name for k in ["lora_", "lora_down", "lora_up"]):
-            p.requires_grad = True
-        else:
-            p.requires_grad = False
+    elevations = [float(e) for e in elevations]
+    azimuths = [float(a) for a in azimuths]
+    num_views = len(elevations)
 
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"[LoRA] trainable params: {trainable/1e6:.2f}M / total {total/1e6:.2f}M")
+    abs_cams = []
+    for theta, az in zip(elevations, azimuths):
+        abs_cams.append(torch.tensor([theta, az, CAMERA_RADIUS],
+                                     dtype=torch.float32))
+
+    debug_cams = [[] for _ in range(num_views)]
+    for i, icam in enumerate(abs_cams):
+        for j, jcam in enumerate(abs_cams):
+            if use_abs_extrinsics:
+                # Absolute encoding: [theta, sin(phi), cos(phi), radius]
+                dcam = torch.tensor(
+                    [icam[0],
+                     math.sin(icam[1]),
+                     math.cos(icam[1]),
+                     icam[2]],
+                    dtype=torch.float32,
+                )
+            else:
+                # Relative encoding: [Δtheta, sin(Δphi), cos(Δphi), Δr]
+                diff = icam - jcam
+                dcam = torch.tensor(
+                    [
+                        diff[0].item(),
+                        math.sin(diff[1].item()),
+                        math.cos(diff[1].item()),
+                        diff[2].item(),
+                    ],
+                    dtype=torch.float32,
+                )
+            debug_cams[i].append(dcam)
+
+    cam = torch.stack([torch.stack(dc) for dc in debug_cams], dim=0)  # [V,V,4]
+
+    # Build intrinsics K from FOV, then flatten to [fx, fy, cx, cy]
+    focal = 1.0 / np.tan(SPAD_FOV / 2.0)
+    intrinsics = np.diag(np.array([focal, focal, 1.0], dtype=np.float32))  # [3,3]
+    intrinsics = torch.from_numpy(intrinsics).unsqueeze(0).float()         # [1,3,3]
+    intrinsics = intrinsics.repeat(num_views, 1, 1)                        # [V,3,3]
+
+    # [V, 4] = [K[0,0], K[1,1], K[0,2], K[1,2]] == [f, f, 0, 0]
+    render_intrinsics_flat = intrinsics[:, [0, 1, 0, 1], [0, 1, 2, 2]]
+
+    return cam, render_intrinsics_flat
 
 
-def get_lora_params(model):
-    params = []
-    for name, p in model.named_parameters():
-        if p.requires_grad:
-            params.append(p)
-    return params
+# ------------------------- LR warmup helper ------------------------- #
 
 
-# ------------------------------------------------------------
-# 2. 蒸馏训练 step：用 teacher 的 epsilon 监督 student
-# ------------------------------------------------------------
-
-def distill_step(student: SPAD,
-                 teacher: SPAD,
-                 batch,
-                 device,
-                 noise_schedule="uniform"):
+def set_lr_with_warmup(optimizer, base_lr, global_step, warmup_steps):
     """
-    一个 training step:
-      1) 用 student.get_input 得到 z, cond
-      2) 采 t, eps, 加噪得到 z_t
-      3) teacher / student 分别预测 eps
-      4) MSE loss
+    Linear warmup:
+        - step <= warmup_steps: lr = base_lr * (step / warmup_steps)
+        - step >  warmup_steps: lr = base_lr  (no decay afterwards)
     """
-
-    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-    # student / teacher 用同一个 get_input（结构完全一致）
-    # 你可以像 inference 那样要更多输出，这里只要 z 和 cond
-    z, cond = student.get_input(batch, return_first_stage_outputs=False, return_uc=False)
-
-    # z: [B, V, C, H, W]  or  [B*V, C, H, W] 取决于 SPAD 实现
-    if z.dim() == 5:
-        B, V, C, H, W = z.shape
-        z = rearrange(z, "b v c h w -> (b v) c h w")
+    if warmup_steps <= 0:
+        lr = base_lr
     else:
-        Bv, C, H, W = z.shape
-        B = Bv   # 这里只是名字，真正 batch_size 看需要
+        if global_step >= warmup_steps:
+            lr = base_lr
+        else:
+            warmup_frac = float(global_step) / float(warmup_steps)
+            lr = base_lr * warmup_frac
 
-    # 获取 diffusion 的时间步数等信息（来自 LatentDiffusion）
-    num_timesteps = student.num_timesteps
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
 
-    # 采 t（这里简单 uniform，你之后可以改成 LCM / DMD 用到的特定采样）
-    t = torch.randint(
-        low=0,
-        high=num_timesteps,
-        size=(z.shape[0],),
-        device=device,
-        dtype=torch.long,
-    )
-
-    # 采高斯噪声
-    noise = torch.randn_like(z)
-
-    # 用 LatentDiffusion 自带的 q_sample 把 z0 加噪得到 z_t
-    # 注意：SPAD 继承自 LatentDiffusion，所以应当有这个函数
-    z_t = student.q_sample(z, t, noise)
-
-    # teacher / student 都在 z_t, t, cond 上跑 UNet
-    # apply_model 是 latent diffusion 的 “UNet 前向”
-    eps_teacher = teacher.apply_model(z_t, t, cond)
-    eps_student = student.apply_model(z_t, t, cond)
-
-    # 蒸馏 loss: 让 student 拟合 teacher 的 epsilon
-    loss = F.mse_loss(eps_student, eps_teacher)
-
-    return loss
+    return lr
 
 
-# ------------------------------------------------------------
-# 3. 训练主函数
-# ------------------------------------------------------------
+# ------------------------- Training loop ------------------------- #
+
+
+def save_checkpoint(model, optimizer, step, outdir, prefix="spad"):
+    os.makedirs(outdir, exist_ok=True)
+    ckpt_path = os.path.join(outdir, f"{prefix}_step_{step:07d}.ckpt")
+    state = {
+        "state_dict": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "global_step": step,
+    }
+    torch.save(state, ckpt_path)
+    print(f"[checkpoint] saved to {ckpt_path}")
+
 
 def train(args):
-    seed_everything(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    # ----------------- Load config ----------------- #
+    config = OmegaConf.load(args.config)
 
-    # ---------- 3.1 加载 config & teacher / student ----------
-    cfg = OmegaConf.load(args.config)
+    # Base learning rate from config unless overridden
+    if args.lr is None:
+        base_lr = float(config.model.base_learning_rate)
+        print(f"Using base_learning_rate from config: {base_lr}")
+    else:
+        base_lr = args.lr
+        print(f"Using overridden learning rate: {base_lr}")
 
-    print("[Load teacher]")
-    teacher = load_model_from_config(cfg, args.teacher_ckpt, verbose=True, inference_run=False)
-    teacher = teacher.to(device).eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
+    warmup_steps = args.warmup_steps
+    print(f"LR warmup steps: {warmup_steps} (then constant LR, no decay)")
 
-    print("[Load student (LoRA)]")
-    # student 初始可以先加载同一个 ckpt，再在外面插 LoRA 模块（你已经改过 mv_unet / attention / GEGLU）
-    student = load_model_from_config(cfg, args.teacher_ckpt, verbose=True, inference_run=False)
-    student = student.to(device).train()
-
-    # 冻结 base 权重，只保留 LoRA
-    freeze_base_weights(student)
-
-    # ---------- 3.2 准备数据 ----------
-    dataset = ObjaverseMultiViewDataset(
+    # ----------------- Dataset & DataLoader ----------------- #
+    train_dataset = ObjaverseMultiViewDataset(
         root=args.data_root,
         num_views=args.num_views,
         image_size=args.image_size,
         training=True,
     )
 
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -153,80 +157,173 @@ def train(args):
         drop_last=True,
     )
 
-    # 循环 dataloader（如果想无限循环训练 steps，可以用 cycle）
-    data_iter = cycle(dataloader)
-
-    # ---------- 3.3 优化器 ----------
-    lora_params = get_lora_params(student)
-    optimizer = torch.optim.AdamW(
-        lora_params, lr=args.lr, weight_decay=args.weight_decay
+    # ----------------- Model ----------------- #
+    # Note: inference_run=False so model is fully configurable for training
+    model: SPAD = load_model_from_config(
+        config,
+        ckpt=args.ckpt if args.ckpt is not None else None,
+        verbose=True,
+        inference_run=False,
     )
+    model = model.to(device)
+    model.train()
 
-    # 简单的线性 warmup + cosine decay 你可以之后再加；现在先固定 lr
+    # Initialize EMA if enabled (SPAD uses EMA for better sampling quality)
+    if getattr(model, "use_ema", False):
+        model.reinit_ema()
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        params,
+        lr=base_lr,                 # this will be immediately scaled by warmup
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999),
+    )
+    optimizer.zero_grad(set_to_none=True)
+    scaler = GradScaler(enabled=args.fp16)
+
     global_step = 0
+    micro_step = 0
+    outdir = args.output_dir
 
-    # ---------- 3.4 训练 loop ----------
-    os.makedirs(args.output_dir, exist_ok=True)
+    for epoch in range(args.num_epochs):
+        print(f"\n===== Epoch {epoch+1}/{args.num_epochs} =====")
 
-    for step in tqdm(range(args.train_steps), desc="training"):
-        batch = next(data_iter)
+        for batch_idx, batch in enumerate(train_loader):
+            micro_step += 1
 
-        optimizer.zero_grad()
+            # Move geometry-related tensors to device
+            batch["epi_constraint_masks"] = batch["epi_constraint_masks"].to(device)
+            batch["plucker_embeds"] = batch["plucker_embeds"].to(device)
 
-        loss = distill_step(student, teacher, batch, device)
-        loss.backward()
+            # Build cam + intrinsics for this batch
+            B, V = batch["img"].shape[:2]
+            cam_list = []
+            intr_list = []
 
-        torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+            for b in range(B):
+                elev = batch["elevations"][b].tolist()  # radians
+                azim = batch["azimuths"][b].tolist()    # radians
+                cam_b, intr_b = build_cam_and_intrinsics_from_radians(
+                    elev,
+                    azim,
+                    use_abs_extrinsics=getattr(model, "use_abs_extrinsics", False),
+                )
+                cam_list.append(cam_b)    # [V, V, 4]
+                intr_list.append(intr_b)  # [V, 4]
 
-        optimizer.step()
+            batch["cam"] = torch.stack(cam_list, dim=0).to(device)                  # [B,V,V,4]
+            batch["render_intrinsics_flat"] = torch.stack(intr_list, dim=0).to(device)  # [B,V,4]
+            batch["txt"] = [batch["txt"]] * V  # replicate captions for all views
 
-        global_step += 1
+            with autocast(enabled=args.fp16):
+                # get_input returns [z, cond, ...]
+                z, cond = model.get_input(batch)[:2]
+                # LatentDiffusion.forward returns (loss, loss_dict)
+                loss, loss_dict = model(z, cond)
 
-        if step % args.log_every == 0:
-            print(f"[step {step}] loss = {loss.item():.6f}")
+            loss_accum = loss / args.accumulate_steps
+            scaler.scale(loss_accum).backward()
+            
+            if micro_step % args.accumulate_steps == 0:
+                global_step += 1
+                # Apply LR warmup schedule (after incrementing global_step)
+                current_lr = set_lr_with_warmup(
+                    optimizer,
+                    base_lr=base_lr,
+                    global_step=global_step,
+                    warmup_steps=warmup_steps,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-        # 定期保存 LoRA 权重
-        if step % args.save_every == 0 and step > 0:
-            ckpt_path = os.path.join(args.output_dir, f"spad_lora_step{step}.pt")
-            # 只保存 LoRA 参数比较小
-            lora_state = {
-                k: v.cpu()
-                for k, v in student.state_dict().items()
-                if v.requires_grad
-            }
-            torch.save(lora_state, ckpt_path)
-            print(f"saved LoRA checkpoint to {ckpt_path}")
+                # Update EMA after optimizer
+                if getattr(model, "use_ema", False):
+                    model.model_ema(model.model)
+
+                # Logging
+                if global_step and global_step % args.log_every == 0:
+                    loss_val = float(loss.detach().cpu())
+                    log_str = f"[step {global_step}] loss: {loss_val:.4f}, lr: {current_lr:.6e}"
+                    if isinstance(loss_dict, dict):
+                        parts = []
+                        for k, v in loss_dict.items():
+                            try:
+                                parts.append(f"{k}: {float(v):.4f}")
+                            except Exception:
+                                continue
+                        if parts:
+                            log_str += " | " + " ".join(parts)
+                    print(log_str)
+
+                # Checkpointing
+                if global_step % args.ckpt_every == 0:
+                    save_checkpoint(model, optimizer, global_step, outdir)
+
+                if args.max_steps is not None and global_step >= args.max_steps:
+                    print(f"Reached max_steps={args.max_steps}, stopping training.")
+                    break
+
+        if args.max_steps is not None and global_step >= args.max_steps:
+            break
+
+    # Final checkpoint
+    if args.save_last:
+        save_checkpoint(model, optimizer, global_step, outdir, prefix="spad_last")
 
 
-# ------------------------------------------------------------
-# 4. argument parser
-# ------------------------------------------------------------
+# ------------------------- Argument parsing ------------------------- #
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
 
-    # 模型 / 数据
-    parser.add_argument("--config", type=str, default="configs/spad_two_views.yaml")
-    parser.add_argument("--teacher_ckpt", type=str, required=True)
-    parser.add_argument("--data_root", type=str, required=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train SPAD on Objaverse")
 
-    # 训练超参
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--num_views", type=int, default=2)
-    parser.add_argument("--image_size", type=int, default=256)
+    # Data
+    parser.add_argument("--data_root", type=str, required=True,
+                        help="Root folder of Objaverse multi-view renderings.")
+    parser.add_argument("--num_views", type=int, default=2,
+                        help="Number of views per object used during training.")
+    parser.add_argument("--image_size", type=int, default=256,
+                        help="Rendered image resolution (assumed square).")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--accumulate_steps", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
 
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    # Model / config
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to SPAD config .yaml (LatentDiffusion-style).")
+    parser.add_argument("--ckpt", type=str, default="data/checkpoints/spad_two_views.ckpt",
+                        help="Optional path to initial checkpoint to resume/fine-tune from.")
 
-    parser.add_argument("--train_steps", type=int, default=100000)
-    parser.add_argument("--log_every", type=int, default=50)
-    parser.add_argument("--save_every", type=int, default=2000)
+    # Training hyperparams
+    parser.add_argument("--num_epochs", type=int, default=10)
+    parser.add_argument(
+        "--lr", type=float, default=None,
+        help="Base learning rate. If None, use config.model.base_learning_rate (1e-4 in SPAD).",
+    )
+    parser.add_argument("--warmup_steps", type=int, default=100,
+                        help="Linear learning rate warmup steps.")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="Weight decay (paper uses None).")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Enable mixed-precision training with autocast + GradScaler.")
+    parser.add_argument("--max_steps", type=int, default=None,
+                        help="Optional max global steps to stop early.")
 
-    parser.add_argument("--output_dir", type=str, default="checkpoints/spad_lora_distill")
-    parser.add_argument("--seed", type=int, default=42)
+    # Logging / checkpoints
+    parser.add_argument("--output_dir", type=str, default="checkpoints_spad",
+                        help="Directory to save checkpoints.")
+    parser.add_argument("--log_every", type=int, default=100,
+                        help="Log losses every N steps.")
+    parser.add_argument("--ckpt_every", type=int, default=10000,
+                        help="Save checkpoint every N steps.")
+    parser.add_argument("--save_last", action="store_true",
+                        help="Save a final 'last' checkpoint at the end of training.")
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+if __name__ == "__main__":
+    args = parse_args()
     train(args)

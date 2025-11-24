@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "8"
 import torch
 import numpy as np
 import math
@@ -187,7 +187,8 @@ if __name__ == "__main__":
     # available models
     model_zoo = {
         "spad_four_views": ("configs/spad_four_views.yaml", "data/checkpoints/spad_four_views.ckpt"),
-        "spad_two_views": ("configs/spad_two_views.yaml", "data/checkpoints/spad_two_views.ckpt"),
+        # "spad_two_views": ("configs/spad_two_views.yaml", "data/checkpoints/spad_two_views.ckpt"),
+        "spad_two_views": ("configs/spad_two_views.yaml", "logs/spad_dubug_dataloader/spad_step_0000700.ckpt"),
     }
 
     # select model

@@ -599,7 +599,7 @@ class UNetModel(nn.Module):
                                 use_new_attention_order=use_new_attention_order,
                             ) if not use_spatial_transformer else SpatialTransformer(
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
-                                disable_self_attn=disabled_sa
+                                disable_self_attn=disabled_sa, lora_rank=lora_rank, lora_alpha=lora_alpha, use_lora=use_lora
                             )
                         )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))

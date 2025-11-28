@@ -164,4 +164,10 @@ class SPAD(LatentDiffusion):
 
     def encode_first_stage(self, *args, **kwargs):
         return LatentDiffusion.encode_first_stage(self, *args, **kwargs)
+    
+    # def insert_lora(self, lora_path, rank=4):
+    #     """Insert LoRA layers into the model."""
+    #     from ldm.modules.diffusionmodules.lora import inject_lora_into_unet
+    #     inject_lora_into_unet(self.model, lora_path, rank)
+    #     print(f"Inserted LoRA layers from {lora_path} with rank {rank}.")
 

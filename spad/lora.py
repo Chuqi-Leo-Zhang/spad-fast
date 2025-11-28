@@ -16,16 +16,24 @@ class LoRALinear(nn.Module):
         self.lora_A = nn.Linear(in_dim, r, bias=False)
         self.lora_B = nn.Linear(r, out_dim, bias=False)
 
-        nn.init.zeros_(self.lora_A.weight)
+        # nn.init.zeros_(self.lora_A.weight)
+        nn.init.normal_(self.lora_A.weight, std=0.02)
         nn.init.zeros_(self.lora_B.weight)
 
-    def forward(self, x):
-        return self.base(x) + self.lora_B(self.lora_A(x)) * self.scaling
+    def forward(self, x, use_lora=True):
+        if use_lora:
+            return self.base(x) + self.lora_B(self.lora_A(x)) * self.scaling
+        else:
+            return self.base(x)
     
     @property
     def weight(self):
         # makes optimizer ignore base.weight correctly
         return self.base.weight
+    
+    @property
+    def bias(self):
+        return self.base.bias
     
 class LoRAConv2d(nn.Module):
 
@@ -52,8 +60,11 @@ class LoRAConv2d(nn.Module):
         nn.init.zeros_(self.lora_down.weight)
         nn.init.zeros_(self.lora_up.weight)
 
-    def forward(self, x):
-        return self.conv(x) + self.lora_up(self.lora_down(x)) * self.scaling
+    def forward(self, x, use_lora=False):
+        if use_lora:
+            return self.conv(x) + self.lora_up(self.lora_down(x)) * self.scaling
+        else:
+            return self.conv(x)
 
     @property
     def weight(self):

@@ -520,7 +520,8 @@ class LCMSpadDistiller:
         pbar = tqdm(total=args.max_steps, desc="LCM-LoRA distillation", dynamic_ncols=True)
 
         data_iter = iter(self.train_loader)
-
+        running_loss = 0.0
+        
         while self.global_step < args.max_steps:
             self.micro_step += 1
             try:
@@ -619,6 +620,7 @@ class LCMSpadDistiller:
 
             # ---- 5. Consistency loss ----
             loss = torch.mean((x0_tnk - x0_tn) ** 2) / args.accumulate_steps
+            running_loss += loss.item()
             loss.backward()
 
             if self.micro_step % args.accumulate_steps == 0:
@@ -632,18 +634,18 @@ class LCMSpadDistiller:
                 self.micro_step = 0
                 self.global_step += 1
 
-            # ---- 7. Logging & checkpoint ----
-            if self.global_step % args.log_every == 0:
-                print(
-                    f"[step {self.global_step}] "
-                    f"loss={loss.item():.6f}, omega={omega:.3f}, "
-                    f"n_idx={n_idx}, t_from_idx={t_from_idx}, t_to_idx={t_to_idx}"
-                )
+                # ---- 7. Logging & checkpoint ----
+                if self.global_step % args.log_every == 0:
+                    print(
+                        f"[step {self.global_step}] "
+                        f"loss={running_loss:.6f}, omega={omega:.3f}, "
+                        f"n_idx={n_idx}, t_from_idx={t_from_idx}, t_to_idx={t_to_idx}"
+                    )
+                    running_loss = 0.0
 
-            if self.global_step % args.ckpt_every == 0 and self.global_step > 0:
-                self.save_checkpoint(f"step_{self.global_step:07d}.pt")
+                if self.global_step % args.ckpt_every == 0 and self.global_step > 0:
+                    self.save_checkpoint(f"step_{self.global_step:07d}.pt")
 
-            if self.micro_step % args.accumulate_steps == 0:
                 pbar.update(1)
 
         # final save

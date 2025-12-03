@@ -46,6 +46,6 @@ nohup python scripts/distill.py \
   --learning_rate 1e-4 \
   --max_steps 3000 \
   --log_every 10 \
-  --ckpt_every 1000 \
+  --ckpt_every 100 \
   --output_dir logs/spad_lcm_lora \
-  > distill.log 2>&1 &
+  > distill_debug.log 2>&1 &

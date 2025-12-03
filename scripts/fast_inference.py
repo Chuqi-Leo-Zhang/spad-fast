@@ -1,68 +1,66 @@
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "8"
-
-import torch
-import torch.nn as nn
-import numpy as np
 import math
-import imageio
 import time
 import argparse
-
-from omegaconf import OmegaConf
-from pytorch_lightning import seed_everything
-from einops import rearrange
 from itertools import chain, cycle
+
+import numpy as np
+import torch
+import torch.nn as nn
+import imageio
+from omegaconf import OmegaConf
+from einops import rearrange
+from pytorch_lightning import seed_everything
 from tqdm import tqdm
 
 from spad.utils import load_model_from_config, slugify
 from spad.geometry import get_batch_from_spherical
-from spad.lora import LoRALinear
+from spad.lora import LoRALinear  # your LoRA module
+from ldm.models.diffusion.ddim import ManyViewDDIMSampler
 
 
-# ----------------- camera & gaussian utils (same as original) -----------------
+SPAD_FOV = 0.702769935131073  # radians
+CAMERA_RADIUS = 3.5
 
 
-def generate_batch(elevations=[45, 45, 45, 45],
-                   azimuths=[0, 90, 180, 270],
-                   use_abs=False):
+# -----------------------------------------------------------------------------
+# Camera + intrinsics (same as original script)
+# -----------------------------------------------------------------------------
+def generate_batch(elevations, azimuths, use_abs=False):
     elevations = [math.radians(e) for e in elevations]
     azimuths = [math.radians(a) for a in azimuths]
 
     batch = get_batch_from_spherical(elevations, azimuths)
 
     abs_cams = []
-    for theta, azimuth in zip(elevations, azimuths):
-        abs_cams.append(torch.tensor([theta, azimuth, 3.5]))
+    for theta, az in zip(elevations, azimuths):
+        abs_cams.append(torch.tensor([theta, az, CAMERA_RADIUS]))
 
     debug_cams = [[] for _ in range(len(azimuths))]
     for i, icam in enumerate(abs_cams):
         for j, jcam in enumerate(abs_cams):
             if use_abs:
-                dcam = torch.tensor([
-                    icam[0],
-                    math.sin(icam[1]),
-                    math.cos(icam[1]),
-                    icam[2],
-                ])
+                dcam = torch.tensor([icam[0],
+                                     math.sin(icam[1]),
+                                     math.cos(icam[1]),
+                                     icam[2]])
             else:
-                dcam = icam - jcam
+                diff = icam - jcam
                 dcam = torch.tensor([
-                    dcam[0].item(),
-                    math.sin(dcam[1].item()),
-                    math.cos(dcam[1].item()),
-                    dcam[2].item(),
+                    diff[0].item(),
+                    math.sin(diff[1].item()),
+                    math.cos(diff[1].item()),
+                    diff[2].item(),
                 ])
             debug_cams[i].append(dcam)
 
-    batch["cam"] = torch.stack([torch.stack(dc) for dc in debug_cams])  # [V,V,4]
+    batch["cam"] = torch.stack([torch.stack(dc) for dc in debug_cams])
 
-    # intrinsics
-    focal = 1 / np.tan(0.702769935131073 / 2)
-    intrinsics = np.diag(np.array([focal, focal, 1])).astype(np.float32)
+    focal = 1.0 / np.tan(SPAD_FOV / 2.0)
+    intrinsics = np.diag(np.array([focal, focal, 1.0], dtype=np.float32))
     intrinsics = torch.from_numpy(intrinsics).unsqueeze(0).float()
     intrinsics = intrinsics.repeat(batch["cam"].shape[0], 1, 1)
-    batch["render_intrinsics_flat"] = intrinsics[:, [0, 1, 0, 1], [0, 1, -1, -1]]
+    batch["render_intrinsics_flat"] = intrinsics[:, [0, 1, 0, 1], [0, 1, 2, 2]]
 
     return batch
 
@@ -70,46 +68,32 @@ def generate_batch(elevations=[45, 45, 45, 45],
 def get_gaussian_image(blob_width=256, blob_height=256, sigma=0.5):
     X = np.linspace(-1, 1, blob_width)[None, :]
     Y = np.linspace(-1, 1, blob_height)[:, None]
-    inv_dev = 1 / sigma ** 2
+    inv_dev = 1.0 / (sigma ** 2)
     gaussian_blob = np.exp(-0.5 * (X ** 2) * inv_dev) * np.exp(-0.5 * (Y ** 2) * inv_dev)
+
     if gaussian_blob.max() > 0:
         gaussian_blob = 255.0 * (gaussian_blob - gaussian_blob.min()) / gaussian_blob.max()
     gaussian_blob = 255.0 - gaussian_blob
 
     gaussian_blob = (gaussian_blob / 255.0) * 2.0 - 1.0
-    gaussian_blob = np.expand_dims(gaussian_blob, axis=-1).repeat(3, -1)
-    gaussian_blob = torch.from_numpy(gaussian_blob)
-    return gaussian_blob
+    gaussian_blob = np.expand_dims(gaussian_blob, axis=-1).repeat(3, axis=-1)
+    return torch.from_numpy(gaussian_blob.astype(np.float32))
 
 
-def load_captions(path="data/1k_captions_viz.npy"):
-    captions = np.load(path, allow_pickle=True).tolist()
-    captions = ["[tdv] " + c if "[tdv]" not in c else c for c in captions]
-    return captions
-
-
-# ----------------- LoRA injection helpers (same as training) -----------------
-
-
+# -----------------------------------------------------------------------------
+# LoRA insertion + EMA-LoRA loading (mirrors your training code)
+# -----------------------------------------------------------------------------
 def _is_class(module: nn.Module, name: str) -> bool:
     return module.__class__.__name__ == name
 
 
-def insert_lora_layers(
-    unet: nn.Module,
-    r: int = 4,
-    alpha: float = 1.0,
-    enable_attn: bool = True,
-    enable_mlp: bool = True,
-):
-    """
-    Add LoRA to SPAD UNet in-place.
-
-    - SPADAttention: to_q, to_k, to_v (Linear), to_out[0] (Linear)
-    - FeedForward:   net = Sequential(GEGLU(proj=Linear), Dropout, Linear)
-    """
+def insert_lora_layers(unet: nn.Module,
+                       r: int = 16,
+                       alpha: float = 16.0,
+                       enable_attn: bool = True,
+                       enable_mlp: bool = True):
+    # SPADAttention + FeedForward
     for module in unet.modules():
-        # 1) Attention: q, k, v, out
         if enable_attn and _is_class(module, "SPADAttention"):
             if isinstance(module.to_q, nn.Linear) and not isinstance(module.to_q, LoRALinear):
                 module.to_q = LoRALinear(module.to_q, r=r, alpha=alpha)
@@ -119,89 +103,40 @@ def insert_lora_layers(
                 module.to_v = LoRALinear(module.to_v, r=r, alpha=alpha)
 
             if isinstance(module.to_out, nn.Sequential):
-                if (
-                    len(module.to_out) > 0
-                    and isinstance(module.to_out[0], nn.Linear)
-                    and not isinstance(module.to_out[0], LoRALinear)
-                ):
+                if len(module.to_out) > 0 and isinstance(module.to_out[0], nn.Linear) \
+                        and not isinstance(module.to_out[0], LoRALinear):
                     module.to_out[0] = LoRALinear(module.to_out[0], r=r, alpha=alpha)
 
-        # 2) FeedForward MLP
         if enable_mlp and _is_class(module, "FeedForward"):
             net = module.net
             if len(net) > 0 and hasattr(net[0], "proj"):
                 proj = net[0].proj
                 if isinstance(proj, nn.Linear) and not isinstance(proj, LoRALinear):
                     net[0].proj = LoRALinear(proj, r=r, alpha=alpha)
+
             if len(net) > 2 and isinstance(net[2], nn.Linear) and not isinstance(net[2], LoRALinear):
                 net[2] = LoRALinear(net[2], r=r, alpha=alpha)
 
 
-# ----------------- schedule helpers (same as training) -----------------
-
-
-def build_train_time_schedule(model, num_train_timesteps: int, device: str):
-    """
-    Build reduced grid (indices -> ᾱ_t, σ_t) from model's DDPM schedule.
-    """
-    assert hasattr(model, "num_timesteps")
-    assert hasattr(model, "alphas_cumprod")
-
-    num_ddpm = int(model.num_timesteps)
-    ddpm_indices = torch.linspace(
-        0, num_ddpm - 1, num_train_timesteps, dtype=torch.long, device=device
-    )
-
-    alphas_cumprod = model.alphas_cumprod.to(device)
-    alpha_bar_train = alphas_cumprod[ddpm_indices]
-
-    sqrt_alpha_bar_train = torch.sqrt(alpha_bar_train)
-    sqrt_one_minus_alpha_bar_train = torch.sqrt(1.0 - alpha_bar_train)
-
-    return ddpm_indices, sqrt_alpha_bar_train, sqrt_one_minus_alpha_bar_train
-
-
-def _expand_scalar_for(x_like: torch.Tensor, scalar: torch.Tensor):
-    while scalar.dim() < x_like.dim():
-        scalar = scalar.view(*scalar.shape, 1)
-    return scalar
-
-
-# ----------------- load SPAD + EMA LoRA student -----------------
-
-
-def load_spad_student_from_ema(
-    config_path: str,
-    teacher_ckpt: str,
-    ema_ckpt_path: str,
-    device: str = "cuda",
-    lora_rank: int = 16,
-    lora_alpha: float = 16.0,
-    train_timesteps: int = 1000,
-):
-    """
-    Load SPAD base model, inject LoRA, then load EMA LoRA weights.
-    Returns:
-        model, ddpm_indices, alphas_train, sigmas_train
-    """
-    model_config = OmegaConf.load(config_path)
-    model = load_model_from_config(
-        model_config,
-        teacher_ckpt,
-        verbose=True,
-        inference_run=True,
-    )
+def load_spad_with_ema_lora(config_path,
+                            teacher_ckpt,
+                            ema_lora_ckpt,
+                            lora_rank=16,
+                            lora_alpha=16.0,
+                            device="cuda"):
+    config = OmegaConf.load(config_path)
+    model = load_model_from_config(config, teacher_ckpt, verbose=True, inference_run=True)
     model.to(device)
 
-    # inject LoRA into the UNet (same as training)
-    insert_lora_layers(
-        model.model.diffusion_model,
-        r=lora_rank,
-        alpha=lora_alpha,
-    )
+    # Disable internal EMA – it does not know about LoRA parameter names
+    if hasattr(model, "use_ema"):
+        model.use_ema = False
 
-    # load EMA LoRA weights
-    ckpt = torch.load(ema_ckpt_path, map_location="cpu")
+    # Inject LoRA into UNet
+    insert_lora_layers(model.model.diffusion_model, r=lora_rank, alpha=lora_alpha)
+
+    # Load EMA-LoRA weights
+    ckpt = torch.load(ema_lora_ckpt, map_location="cpu")
     ema_lora = ckpt["ema_lora"]
 
     with torch.no_grad():
@@ -209,287 +144,165 @@ def load_spad_student_from_ema(
             if name in ema_lora:
                 p.copy_(ema_lora[name].to(p.device))
 
+    model.to(device)
     model.eval()
-
-    # schedule for LCM sampling
-    ddpm_indices, alphas_train, sigmas_train = build_train_time_schedule(
-        model,
-        num_train_timesteps=train_timesteps,
-        device=device,
-    )
-
-    return model, ddpm_indices, alphas_train, sigmas_train
+    return model
 
 
-# ----------------- LCM 4-step sampler -----------------
+# -----------------------------------------------------------------------------
+# DDIM sampling (original SPAD sampler, but with ddim_steps=4 etc.)
+# -----------------------------------------------------------------------------
+def denoise(batch, model, device, idx, total_views, outpath, blob_sigma, ddim_steps):
+    sampler = ManyViewDDIMSampler(model)
 
+    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+             for k, v in batch.items()}
 
-@torch.no_grad()
-def lcm_spad_sample(
-    model,
-    ddpm_indices: torch.Tensor,
-    alphas_train: torch.Tensor,
-    sigmas_train: torch.Tensor,
-    shape,
-    cond,
-    uc,
-    num_sampling_steps: int = 4,
-    omega: float = 7.5,
-    device: str = "cuda",
-):
-    """
-    LCM-style multi-step sampling:
-    - start from z_T ~ N(0, I)
-    - step t_T -> ... -> t_0
-
-    shape: latent shape, e.g. [B,V,C,H,W] or [B,C,H,W]
-    """
-    device = torch.device(device)
-    ddpm_indices = ddpm_indices.to(device)
-    alphas_train = alphas_train.to(device)
-    sigmas_train = sigmas_train.to(device)
-
-    num_train = len(alphas_train)
-    z = torch.randn(shape, device=device)
-
-    # time indices from large -> small on training grid
-    t_indices = torch.linspace(
-        num_train - 1,
-        0,
-        steps=num_sampling_steps,
-        dtype=torch.long,
-        device=device,
-    )
-
-    for i in range(num_sampling_steps - 1):
-        t_idx = int(t_indices[i].item())
-        t_next_idx = int(t_indices[i + 1].item())
-
-        ddpm_t = int(ddpm_indices[t_idx].item())
-
-        # build t_batch to match z shape
-        if z.dim() == 5:
-            n, v = z.shape[:2]
-            t_batch = torch.full((n, v), ddpm_t, device=device, dtype=torch.long)
-        else:
-            b = z.shape[0]
-            t_batch = torch.full((b,), ddpm_t, device=device, dtype=torch.long)
-
-        # eps_cond / eps_uncond (same as training)
-        eps_c = model.apply_model(z, t_batch, cond)
-        eps_u = model.apply_model(z, t_batch, uc)
-        eps = (1.0 + omega) * eps_c - omega * eps_u
-
-        alpha_t = _expand_scalar_for(z, alphas_train[t_idx])
-        sigma_t = _expand_scalar_for(z, sigmas_train[t_idx])
-
-        x0_pred = (z - sigma_t * eps) / alpha_t
-
-        alpha_next = _expand_scalar_for(z, alphas_train[t_next_idx])
-        sigma_next = _expand_scalar_for(z, sigmas_train[t_next_idx])
-
-        z = alpha_next * x0_pred + sigma_next * eps
-
-    return z  # approximately clean z_0 at t=0
-
-
-# ----------------- denoise wrapper using LCM student -----------------
-
-
-def denoise_lcm(
-    batch,
-    model,
-    device,
-    idx,
-    total_views,
-    outpath,
-    blob_sigma,
-    ddpm_indices,
-    alphas_train,
-    sigmas_train,
-    num_sampling_steps,
-    omega,
-):
-    # move batch tensors to device
-    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-    # gaussian blob init (only used to build cond/uc via get_input)
+    # Gaussian blob init
     blob = get_gaussian_image(sigma=blob_sigma)
     batch["img"][:, :] = blob
-    print("using gaussian initialization for input images")
+    print("using gaussian initialization")
 
-    # get latent shape + cond / uc as in training (LCM distillation)
-    z0, cond, uc = model.get_input(
+    # SPAD get_input
+    z, c, x, xrec, xc, uc = model.get_input(
         batch,
-        return_first_stage_outputs=False,
-        return_original_cond=False,
+        return_first_stage_outputs=True,
+        force_c_encode=True,
+        return_original_cond=True,
         return_uc=True,
     )
-    z0 = z0.to(device)
-    latent_shape = z0.shape
 
-    # sampling with LCM 4-step student
-    samples = lcm_spad_sample(
-        model,
-        ddpm_indices,
-        alphas_train,
-        sigmas_train,
-        shape=latent_shape,
-        cond=cond,
-        uc=uc,
-        num_sampling_steps=num_sampling_steps,
-        omega=omega,
-        device=device,
+    shape = (model.channels, model.image_size, model.image_size)
+    batch_size = (len(x), total_views)
+
+    kwargs = dict(
+        unconditional_conditioning=uc,
+        x0=z,   # blob latents
     )
 
-    x_samples_cfg = model.decode_first_stage(samples)
-    x_samples_cfg = torch.clamp(x_samples_cfg, -1., 1.)
+    samples, _ = sampler.sample(
+        ddim_steps,
+        batch_size,
+        shape,
+        c,
+        verbose=False,
+        **kwargs,
+    )
 
-    # flatten images and captions (same as original)
-    x_samples = rearrange(x_samples_cfg, "b v c h w -> (b v) c h w")
-    x_samples = ((x_samples + 1.0) / 2.0)
+    x_samples = model.decode_first_stage(samples)
+    x_samples = torch.clamp(x_samples, -1., 1.)
+
+    # flatten & tile views
+    x_samples = rearrange(x_samples, "b v c h w -> (b v) c h w")
+    x_samples = (x_samples + 1.0) / 2.0
     xtxt = np.array(batch["txt"]).T.tolist()
     xtxt = list(chain(*xtxt))
+
     x_samples = rearrange(x_samples, "(n v) c h w -> n h (v w) c", v=total_views)
-    x_samples = (x_samples * 255.0).cpu().float().numpy().astype(np.uint8)
+    x_samples = (x_samples * 255.0).cpu().numpy().astype(np.uint8)
 
     os.makedirs(outpath, exist_ok=True)
     for _idx, (image, caption) in enumerate(zip(x_samples, xtxt)):
         caption = slugify(caption)
-        save_path = f"{outpath}/{caption}.png"
+        save_path = os.path.join(outpath, f"{caption}.png")
         imageio.imsave(save_path, image)
         print(f"saved image: {save_path}")
 
-    return {}
+
+# -----------------------------------------------------------------------------
+# Caption utils
+# -----------------------------------------------------------------------------
+def load_captions(path):
+    caps = np.load(path, allow_pickle=True).tolist()
+    caps = ["[tdv] " + c if "[tdv]" not in c else c for c in caps]
+    return caps
 
 
-# ----------------- main -----------------
-
-
-def main(
-    config_path,
-    teacher_ckpt,
-    ema_ckpt,
-    captions,
-    cfg_scale=7.5,
-    blob_sigma=0.5,
-    batch_size=1,
-    total_views=8,
-    num_sampling_steps=4,
-    train_timesteps=1000,
-):
-    """
-    cfg_scale here is used as ω (CFG scale) for LCM.
-    """
+# -----------------------------------------------------------------------------
+# main
+# -----------------------------------------------------------------------------
+def main(args):
     seed_everything(42 + 69)
 
-    # device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    device = torch.device("cpu")
-    # breakpoint()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # load SPAD + EMA LoRA student
-    model, ddpm_indices, alphas_train, sigmas_train = load_spad_student_from_ema(
-        config_path,
-        teacher_ckpt,
-        ema_ckpt,
+    model = load_spad_with_ema_lora(
+        args.config,
+        args.teacher_ckpt,
+        args.ema_lora_ckpt,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         device=device,
-        lora_rank=16,      # must match distillation
-        lora_alpha=16.0,   # must match distillation
-        train_timesteps=train_timesteps,
     )
 
-    # logging dirs
+    # CFG for SPAD
+    model.cfg_conds = ["txt"]
+    model.cfg_scales = [args.cfg_scale]
+
     visuals_dir = "data/visuals/"
     ts = str(round(time.time()))
-    outdir = os.path.join(visuals_dir, "inference_lcm", ts)
+    outdir = os.path.join(visuals_dir, "inference_lcm_lora", ts)
     os.makedirs(outdir, exist_ok=True)
 
+    if args.captions is not None:
+        caps = eval(f'"{args.captions}"')
+        caps = [caps] if isinstance(caps, str) else caps
+        caps = ["[tdv] " + c if "[tdv]" not in c else c for c in caps]
+    else:
+        caps = load_captions(args.captions_file)
+
+    print(f"num of captions: {len(caps)}, batch_size: {args.batch_size}")
+
+    # add opt params
     dataloader = cycle([{
-        "img": torch.zeros(batch_size, total_views, 256, 256, 3)
+        "img": torch.zeros(args.batch_size, args.total_views, 256, 256, 3)
     }])
 
     terminate = False
     with torch.no_grad():
-        for idx, batch in enumerate(tqdm(dataloader, desc="LCM sampling")):
-            if batch_size * (idx + 1) >= len(captions):
-                batch_size = len(captions) - batch_size * idx
+        for idx, batch in enumerate(tqdm(dataloader, desc="sampling")):
+            if args.batch_size * (idx + 1) >= len(caps):
+                bs = len(caps) - args.batch_size * idx
                 terminate = True
+            else:
+                bs = args.batch_size
 
-            elevations = [45 for _ in range(total_views)]
-            azimuths = [az for az in np.linspace(0, 360 * ((total_views - 1) / total_views), total_views)]
+            elevations = [45 for _ in range(args.total_views)]
+            azimuths = list(np.linspace(0,
+                                        360 * ((args.total_views - 1) / args.total_views),
+                                        args.total_views))
             print(f"using elevations: {elevations}, azimuths: {azimuths}")
 
-            batch_cams = generate_batch(elevations, azimuths, use_abs=getattr(model, "use_abs_extrinsics", False))
-            batch_cams = {k: v[None].repeat_interleave(batch_size, dim=0).to(device)
+            batch_cams = generate_batch(elevations, azimuths, use_abs=model.use_abs_extrinsics)
+            batch_cams = {k: v[None].repeat_interleave(bs, dim=0).to(device)
                           for k, v in batch_cams.items()}
             batch.update(batch_cams)
 
-            # captions for this mini-batch
-            batch["txt"] = [captions[batch_size * idx: batch_size * (idx + 1)]] * total_views
+            batch["txt"] = [caps[args.batch_size * idx: args.batch_size * idx + bs]] * args.total_views
 
-            # no EMA scope here; model already uses EMA LoRA weights
-            denoise_lcm(
-                batch,
-                model,
-                device,
-                idx,
-                total_views,
-                outdir,
-                blob_sigma,
-                ddpm_indices,
-                alphas_train,
-                sigmas_train,
-                num_sampling_steps=num_sampling_steps,
-                omega=cfg_scale,
-            )
+            denoise(batch, model, device, idx, args.total_views, outdir,
+                    args.blob_sigma, args.ddim_steps)
 
             if terminate:
                 break
 
 
 if __name__ == "__main__":
-    # same model zoo style as original
-    model_zoo = {
-        "spad_four_views": ("configs/spad_four_views.yaml", "data/checkpoints/spad_four_views.ckpt"),
-        "spad_two_views": ("configs/spad_two_views.yaml", "data/checkpoints/spad_two_views.ckpt"),
-    }
-
-    parser = argparse.ArgumentParser("LCM-LoRA 4-step inference for SPAD")
-    parser.add_argument("--captions", type=str, default=None,
-                        help="caption string or list; if None, uses default captions_eval.npy")
-    parser.add_argument("--model", type=str, default="spad_two_views")
-    parser.add_argument("--ema_ckpt", type=str, required=True,
-                        help="Path to EMA LoRA checkpoint (e.g., logs/spad_lcm_lora/last.pt)")
-    parser.add_argument("--cfg_scale", type=float, default=7.5,
-                        help="LCM CFG scale ω (should be within [w_min, w_max] used in distillation)")
+    parser = argparse.ArgumentParser("4-step LCM-LoRA SPAD inference")
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--teacher_ckpt", type=str, required=True)
+    parser.add_argument("--ema_lora_ckpt", type=str, required=True,
+                        help="LCM-LoRA distillation checkpoint (contains ema_lora)")
+    parser.add_argument("--captions", type=str, default=None)
+    parser.add_argument("--captions_file", type=str, default="data/captions_eval.npy")
+    parser.add_argument("--cfg_scale", type=float, default=4.0)
     parser.add_argument("--blob_sigma", type=float, default=0.5)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--total_views", type=int, default=8)
-    parser.add_argument("--num_sampling_steps", type=int, default=4,
-                        help="Number of LCM steps (target of distillation)")
-    parser.add_argument("--train_timesteps", type=int, default=1000,
-                        help="Reduced training grid T used in distillation (must match training script)")
+    parser.add_argument("--ddim_steps", type=int, default=4,
+                        help="Number of DDIM steps for fast sampler")
+    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=float, default=16.0)
+
     args = parser.parse_args()
-
-    if args.captions is not None:
-        captions = eval(f'"{args.captions}"')
-        captions = [captions] if isinstance(captions, str) else captions
-        captions = ["[tdv] " + c if "[tdv]" not in c else c for c in captions]
-    else:
-        captions = load_captions("data/captions_eval.npy")
-
-    print(f"num of captions: {len(captions)}, batch_size: {args.batch_size}")
-
-    config_path, teacher_ckpt = model_zoo[args.model]
-    main(
-        config_path=config_path,
-        teacher_ckpt=teacher_ckpt,
-        ema_ckpt=args.ema_ckpt,
-        captions=captions,
-        cfg_scale=args.cfg_scale,
-        blob_sigma=args.blob_sigma,
-        batch_size=args.batch_size,
-        total_views=args.total_views,
-        num_sampling_steps=args.num_sampling_steps,
-        train_timesteps=args.train_timesteps,
-    )
+    main(args)

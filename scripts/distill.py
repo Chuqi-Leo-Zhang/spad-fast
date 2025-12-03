@@ -505,7 +505,7 @@ class LCMSpadDistiller:
     def save_checkpoint(self, name: str):
         ckpt_path = os.path.join(self.args.output_dir, name)
         save_dict = {
-            # "student_lora": {name: p.detach().cpu() for name, p in self.lora_named_params},
+            "student_lora": {name: p.detach().cpu() for name, p in self.lora_named_params},
             "ema_lora": {name: t.detach().cpu() for name, t in self.ema_lora.items()},
             # "optimizer": self.optimizer.state_dict(),
             # "global_step": self.global_step,
@@ -619,7 +619,28 @@ class LCMSpadDistiller:
             )
 
             # ---- 5. Consistency loss ----
-            loss = torch.mean((x0_tnk - x0_tn) ** 2) / args.accumulate_steps
+            loss_consistency = torch.mean((x0_tnk - x0_tn) ** 2) / args.accumulate_steps
+
+            # ---- 6. Teacher-matching loss on ε at t_from_idx ----
+            ddpm_t = int(self.ddpm_indices[t_from_idx].item())
+            if z_tnk.dim() == 5:
+                n, v = z_tnk.shape[:2]
+                t_batch = torch.full((n, v), ddpm_t, device=self.device, dtype=torch.long)
+            else:
+                b = z_tnk.shape[0]
+                t_batch = torch.full((b,), ddpm_t, device=self.device, dtype=torch.long)
+
+            with torch.no_grad():
+                eps_teacher_c = self.teacher.apply_model(z_tnk, t_batch, cond)
+                eps_teacher_u = self.teacher.apply_model(z_tnk, t_batch, ucond)
+                eps_teacher   = (1.0 + omega) * eps_teacher_c - omega * eps_teacher_u
+
+            eps_student_c = self.student.apply_model(z_tnk, t_batch, cond)
+            eps_student_u = self.student.apply_model(z_tnk, t_batch, ucond)
+            eps_student   = (1.0 + omega) * eps_student_c - omega * eps_student_u
+            loss_teacher = torch.mean((eps_student - eps_teacher) ** 2)
+
+            loss = (loss_consistency + args.lambda_teacher * loss_teacher) / args.accumulate_steps
             running_loss += loss.item()
             loss.backward()
 
@@ -725,6 +746,10 @@ def parse_args():
                         help="LoRA rank r")
     parser.add_argument("--lora_alpha", type=float, default=16,
                         help="LoRA scaling factor α")
+    parser.add_argument("--lambda_teacher", type=float, default=0.1,
+        help="Weight for teacher matching loss (eps-student vs eps-teacher).",
+    )
+
 
     parser.add_argument("--w_min", type=float, default=3.0,
                         help="Min CFG scale ω used in distillation (LCM-LoRA typically 0~2)")

@@ -138,6 +138,7 @@ def load_spad_with_ema_lora(config_path,
     # Load EMA-LoRA weights
     ckpt = torch.load(ema_lora_ckpt, map_location="cpu")
     ema_lora = ckpt["ema_lora"]
+    # ema_lora = ckpt["student_lora"]
 
     with torch.no_grad():
         for name, p in model.named_parameters():

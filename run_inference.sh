@@ -28,9 +28,9 @@ export PYTHONPATH="/home/zhuomin/leo/spad-fast":$PYTHONPATH
 python scripts/fast_inference.py \
   --config configs/spad_two_views.yaml \
   --teacher_ckpt data/checkpoints/spad_two_views.ckpt \
-  --ema_lora_ckpt logs/spad_lcm_lora/step_0002000.pt \
+  --ema_lora_ckpt logs/spad_lcm_lora/step_0001500.pt \
   --captions "Yellow Toyota Celica sports car." \
-  --ddim_steps 4 \
+  --ddim_steps 20 \
   --cfg_scale 7.5 \
   --batch_size 1 \
   --total_views 8

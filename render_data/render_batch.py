@@ -41,7 +41,7 @@ if __name__ == '__main__':
 
     with open('cap3d_intersect.txt', 'r') as f:
         all_uids = [line.strip() for line in f.readlines()]
-    uids = all_uids[9:10]
+    uids = all_uids[0:10]
     save_pickle(uids, f'training/uid_set.pkl')
 
     processes = 1
